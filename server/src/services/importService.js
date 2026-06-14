@@ -90,6 +90,8 @@ async function commitImport(importId, groupId, userId, decisions) {
     let processedCount = 0;
     let skippedCount = 0;
     const results = [];
+    const userCache = {};
+    const membershipCache = new Set();
 
     for (const decision of decisions) {
       const { row_number, action, row_data, overrides } = decision;
@@ -105,7 +107,7 @@ async function commitImport(importId, groupId, userId, decisions) {
 
         try {
           // Resolve user IDs for payer and participants
-          const payerId = await resolveUserId(conn, data.paid_by, groupId);
+          const payerId = await resolveUserId(conn, data.paid_by, groupId, userCache, membershipCache);
           if (!payerId) {
             results.push({ row_number, action: 'error', reason: `Could not resolve payer: ${data.paid_by}` });
             skippedCount++;
@@ -118,7 +120,7 @@ async function commitImport(importId, groupId, userId, decisions) {
           if (isSettlement) {
             // Import as settlement
             const participants = (data.split_with || '').split(';').map(n => n.trim()).filter(Boolean);
-            const toUserId = participants.length > 0 ? await resolveUserId(conn, participants[0], groupId) : null;
+            const toUserId = participants.length > 0 ? await resolveUserId(conn, participants[0], groupId, userCache, membershipCache) : null;
 
             if (toUserId) {
               await conn.query(
@@ -136,8 +138,8 @@ async function commitImport(importId, groupId, userId, decisions) {
             const splitType = data.split_type || 'equal';
 
             const [expResult] = await conn.query(
-              `INSERT INTO expenses (group_id, description, paid_by, amount, currency, split_type, expense_date, notes, import_row)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               `INSERT INTO expenses (group_id, description, paid_by, amount, currency, split_type, expense_date, notes, import_row)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [groupId, data.description, payerId, amount, currency, splitType,
                data.parsed_date, data.notes || null, row_number]
             );
@@ -145,7 +147,7 @@ async function commitImport(importId, groupId, userId, decisions) {
 
             // Calculate and insert splits
             const participants = (data.split_with || '').split(';').map(n => n.trim()).filter(Boolean);
-            const splits = await calculateSplits(conn, expenseId, splitType, amount, participants, data.split_details, groupId);
+            const splits = await calculateSplits(conn, expenseId, splitType, amount, participants, data.split_details, groupId, userCache, membershipCache);
 
             for (const split of splits) {
               await conn.query(
@@ -203,11 +205,25 @@ async function commitImport(importId, groupId, userId, decisions) {
  * Resolve a display name to a user ID, creating guest users if needed.
  * Always ensures the user is a member of the given group.
  */
-async function resolveUserId(conn, displayName, groupId) {
+async function resolveUserId(conn, displayName, groupId, userCache = {}, membershipCache = new Set()) {
   if (!displayName || displayName.trim() === '') return null;
 
   const normalized = normalizeName(displayName);
   const canonical = findCanonicalMatch(displayName) || normalized;
+  const cacheKey = `${groupId}:${canonical.toLowerCase()}`;
+
+  if (userCache[cacheKey]) {
+    const userId = userCache[cacheKey];
+    const membershipKey = `${groupId}:${userId}`;
+    if (!membershipCache.has(membershipKey)) {
+      await conn.query(
+        'INSERT IGNORE INTO group_memberships (group_id, user_id, joined_at, is_active) VALUES (?, ?, ?, TRUE)',
+        [groupId, userId, '2026-02-01']
+      );
+      membershipCache.add(membershipKey);
+    }
+    return userId;
+  }
 
   // Try to find by display_name (case-insensitive)
   const [users] = await conn.query(
@@ -217,11 +233,15 @@ async function resolveUserId(conn, displayName, groupId) {
 
   if (users.length > 0) {
     const userId = users[0].id;
-    // Ensure user is a member of THIS group (they may exist from another group)
-    await conn.query(
-      'INSERT IGNORE INTO group_memberships (group_id, user_id, joined_at, is_active) VALUES (?, ?, ?, TRUE)',
-      [groupId, userId, '2026-02-01']
-    );
+    userCache[cacheKey] = userId;
+    const membershipKey = `${groupId}:${userId}`;
+    if (!membershipCache.has(membershipKey)) {
+      await conn.query(
+        'INSERT IGNORE INTO group_memberships (group_id, user_id, joined_at, is_active) VALUES (?, ?, ?, TRUE)',
+        [groupId, userId, '2026-02-01']
+      );
+      membershipCache.add(membershipKey);
+    }
     return userId;
   }
 
@@ -234,24 +254,29 @@ async function resolveUserId(conn, displayName, groupId) {
     [guestUsername, guestEmail, 'GUEST_NO_LOGIN', canonical]
   );
 
+  const newUserId = result.insertId;
+  userCache[cacheKey] = newUserId;
+  const membershipKey = `${groupId}:${newUserId}`;
+
   // Add to group
   await conn.query(
     'INSERT IGNORE INTO group_memberships (group_id, user_id, joined_at, is_active) VALUES (?, ?, ?, TRUE)',
-    [groupId, result.insertId, '2026-02-01']
+    [groupId, newUserId, '2026-02-01']
   );
+  membershipCache.add(membershipKey);
 
-  return result.insertId;
+  return newUserId;
 }
 
 /**
  * Calculate expense splits based on split type.
  */
-async function calculateSplits(conn, expenseId, splitType, totalAmount, participantNames, splitDetails, groupId) {
+async function calculateSplits(conn, expenseId, splitType, totalAmount, participantNames, splitDetails, groupId, userCache = {}, membershipCache = new Set()) {
   const splits = [];
   const participantIds = [];
 
   for (const name of participantNames) {
-    const userId = await resolveUserId(conn, name, groupId);
+    const userId = await resolveUserId(conn, name, groupId, userCache, membershipCache);
     if (userId) participantIds.push({ userId, name: normalizeName(name) });
   }
 
