@@ -34,7 +34,7 @@ A full-stack shared expenses application for flatmates built with **React + Vite
 ### 1. Clone and Install
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/Naveen2-G/FairSplit.git
 cd InternshipTask
 
 # Install server dependencies
